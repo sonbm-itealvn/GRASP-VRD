@@ -1591,4 +1591,6 @@ Pipeline ghi log số proposal YOLO, số vùng chuyển sang RegionCLIP, số v
 
 Khi đánh giá scene graph, `RL/reinforcement_learning.py` trả thêm `sgdet_recall@50`. Đây là Recall@50 theo bộ ba `(subject, predicate, object)`, không phải AP@50: lấy tối đa 50 dự đoán có confidence cao nhất, yêu cầu ba nhãn khớp và IoU của cả hộp subject lẫn object đạt ít nhất `0.50`. Kết quả gồm `sgdet_recall@50`, `sgdet_hits@50`, `sgdet_ground_truths` và `sgdet_iou_threshold`. Metric chỉ tính được khi ground truth và prediction có bbox subject/object; mẫu thiếu bbox không được đưa vào mẫu số.
 
+Pipeline lọc ngữ nghĩa trong `boundingbox_objects.py` dùng `SEMANTIC_FILTER_THRESHOLD=0.20` và giữ tối đa `SEMANTIC_FILTER_TOP_K=10` quan hệ sau khi xếp hạng theo confidence rồi visual similarity. Hai giá trị có thể thay đổi qua biến môi trường; log ghi số quan hệ trước/sau lọc và thời gian lọc. Bước SGDET hiện dùng ghép tham lam theo thứ tự confidence (`greedy_confidence_order`), không dùng Hungarian cho metric này. Hungarian chỉ được dùng trong `models/matcher.py` cho matching trong quá trình huấn luyện RelTR. Thời gian `sgdet_matching_time_seconds` được đo riêng quanh bước khớp quan hệ và được trả về trong metrics.
+
 RegionCLIP reference: https://github.com/microsoft/RegionCLIP và model zoo chính thức trong `docs/MODEL_ZOO.md`.

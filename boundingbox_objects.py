@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import cv2
 import numpy as np
 import torch
@@ -43,6 +44,57 @@ REL_CLASSES = ['__background__', 'above', 'across', 'against', 'along', 'and', '
                'looking at', 'lying on', 'made of', 'mounted on', 'near', 'of', 'on', 'on back of', 'over',
                'painted on', 'parked on', 'part of', 'playing', 'riding', 'says', 'sitting on', 'standing on',
                'to', 'under', 'using', 'walking in', 'walking on', 'watching', 'wearing', 'wears', 'with']
+
+SEMANTIC_FILTER_THRESHOLD = float(os.getenv("SEMANTIC_FILTER_THRESHOLD", "0.20"))
+SEMANTIC_FILTER_TOP_K = int(os.getenv("SEMANTIC_FILTER_TOP_K", "10"))
+
+
+def filter_relationships_semantically(
+    relationships: List[Dict[str, Any]],
+    threshold: float = SEMANTIC_FILTER_THRESHOLD,
+    top_k: int = SEMANTIC_FILTER_TOP_K,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Filter relationships by visual similarity, then keep the top-k scores.
+
+    The top-k stage is deterministic: relationships are ranked by confidence,
+    then visual similarity, preserving original order for ties. Special LLM
+    and heuristic relations bypass the similarity threshold but still compete
+    in the final top-k ranking. ``top_k <= 0`` disables the cap.
+    """
+    started = time.perf_counter()
+    thresholded = []
+    always_keep_sources = {"heuristic_spatial", "llm_open_vocab", "llm_enhanced", "llm_missing_pair"}
+    for index, relationship in enumerate(relationships or []):
+        similarity = relationship.get("visual_similarity")
+        source = relationship.get("source", "model")
+        if source in always_keep_sources or similarity is None or similarity >= threshold:
+            item = dict(relationship)
+            item["_semantic_order"] = index
+            thresholded.append(item)
+    if top_k > 0:
+        ranked = sorted(
+            thresholded,
+            key=lambda item: (
+                float(item.get("confidence", 0.0)),
+                float(item.get("visual_similarity", -1.0) if item.get("visual_similarity") is not None else -1.0),
+                -int(item.get("_semantic_order", 0)),
+            ),
+            reverse=True,
+        )[:top_k]
+    else:
+        ranked = thresholded
+    filtered = []
+    for item in ranked:
+        item.pop("_semantic_order", None)
+        filtered.append(item)
+    return filtered, {
+        "input_count": len(relationships or []),
+        "thresholded_count": len(thresholded),
+        "kept_count": len(filtered),
+        "threshold": threshold,
+        "top_k": top_k,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
 
 # LLM Open-Vocab Configuration
 LLM_CONFIDENCE_THRESHOLD = 0.6  # Raised from 0.4 - LLM intervenes more often
@@ -780,6 +832,8 @@ def run_reltr_inference(objects, img_path, args, global_context=None, output_jso
                 "subject": subj,
                 "relation": final_relation,
                 "object": obj,
+                "subject_bbox": subj_bbox,
+                "object_bbox": obj_bbox,
                 "confidence": final_confidence,
                 "source": source
             }
@@ -823,18 +877,17 @@ def run_reltr_inference(objects, img_path, args, global_context=None, output_jso
         except Exception as e:
             print(f"[LLM] Enhancement failed: {e}")
     
-    threshold = 0.2
-    filtered_relationships = []
-    for rel in relationships:
-        similarity = rel.get("visual_similarity")
-        # Always keep heuristic_spatial and LLM relations
-        source = rel.get("source", "model")
-        if source in ("heuristic_spatial", "llm_open_vocab", "llm_enhanced", "llm_missing_pair"):
-            filtered_relationships.append(rel)
-        elif similarity is None or similarity >= threshold:
-            filtered_relationships.append(rel)
-    
-    print(f"📊 Lọc mối quan hệ: {len(filtered_relationships)}/{len(relationships)} đạt ngưỡng {threshold}")
+    filtered_relationships, semantic_stats = filter_relationships_semantically(
+        relationships,
+        threshold=SEMANTIC_FILTER_THRESHOLD,
+        top_k=SEMANTIC_FILTER_TOP_K,
+    )
+    print(
+        f"📊 Lọc ngữ nghĩa: {semantic_stats['thresholded_count']}/{semantic_stats['input_count']} "
+        f"đạt ngưỡng {semantic_stats['threshold']}; giữ top-k={semantic_stats['top_k']} "
+        f"→ {semantic_stats['kept_count']} quan hệ "
+        f"({semantic_stats['elapsed_seconds']:.6f}s)"
+    )
     
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(filtered_relationships, f, indent=4, ensure_ascii=False)

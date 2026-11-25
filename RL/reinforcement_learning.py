@@ -8,6 +8,7 @@ import numpy as np
 from collections import deque, Counter
 import random
 import math
+import time
 import os
 import json
 import shutil
@@ -1705,6 +1706,7 @@ class RelationshipReinforcementLearning:
         iou_threshold: float = 0.5,
     ) -> Dict[str, Any]:
         """Calculate SGDET Recall@K over triplets with subject/object IoU."""
+        started = time.perf_counter()
         total_hits = 0
         total_ground_truths = 0
         evaluated = 0
@@ -1732,6 +1734,8 @@ class RelationshipReinforcementLearning:
             'sgdet_ground_truths': total_ground_truths,
             'sgdet_num_samples': evaluated,
             'sgdet_iou_threshold': iou_threshold,
+            'sgdet_matching_strategy': 'greedy_confidence_order',
+            'sgdet_matching_time_seconds': time.perf_counter() - started,
         }
 
     def _compute_relationship_confusion(
@@ -1867,6 +1871,8 @@ class RelationshipReinforcementLearning:
                 'sgdet_ground_truths': 0,
                 'sgdet_num_samples': 0,
                 'sgdet_iou_threshold': 0.5,
+                'sgdet_matching_strategy': 'greedy_confidence_order',
+                'sgdet_matching_time_seconds': 0.0,
             }
 
         print(f"[RL] Evaluating relationship metrics on {len(evaluation_data)} samples")
@@ -1967,6 +1973,8 @@ class RelationshipReinforcementLearning:
                 'sgdet_ground_truths': 0,
                 'sgdet_num_samples': 0,
                 'sgdet_iou_threshold': 0.5,
+                'sgdet_matching_strategy': 'greedy_confidence_order',
+                'sgdet_matching_time_seconds': 0.0,
             }
 
         precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
@@ -1987,7 +1995,9 @@ class RelationshipReinforcementLearning:
               f"mR@50={mr_at_k_results.get('mr@50', 0.0):.4f}, mR@100={mr_at_k_results.get('mr@100', 0.0):.4f}")
         print(f"[RL] SGDET Recall@50={sgdet_results['sgdet_recall@50']:.4f} "
               f"(hits={sgdet_results['sgdet_hits@50']}/{sgdet_results['sgdet_ground_truths']}, "
-              f"IoU={sgdet_results['sgdet_iou_threshold']:.2f})")
+              f"IoU={sgdet_results['sgdet_iou_threshold']:.2f}, "
+              f"matching={sgdet_results['sgdet_matching_strategy']}, "
+              f"time={sgdet_results['sgdet_matching_time_seconds']:.6f}s)")
         
         return {
             'precision': precision,
