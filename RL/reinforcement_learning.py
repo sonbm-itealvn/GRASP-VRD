@@ -1360,6 +1360,8 @@ class RelationshipReinforcementLearning:
                             'subject': objects[int(subj_idx)].get('class', 'unknown'),
                             'relation': relation_name,
                             'object': objects[int(obj_idx)].get('class', 'unknown'),
+                            'subject_bbox': objects[int(subj_idx)].get('bbox'),
+                            'object_bbox': objects[int(obj_idx)].get('bbox'),
                             'confidence': min(confidence, 1.0),
                             'source': 'model',
                         })
@@ -1389,6 +1391,8 @@ class RelationshipReinforcementLearning:
                     'subject': objects[i].get('class', 'unknown'),
                     'relation': relation_name,
                     'object': objects[j].get('class', 'unknown'),
+                    'subject_bbox': objects[i].get('bbox'),
+                    'object_bbox': objects[j].get('bbox'),
                     'confidence': confidence,
                     'source': 'model_fallback',
                 })
@@ -1617,6 +1621,119 @@ class RelationshipReinforcementLearning:
             self._normalize_label(relationship.get('object', '')),
         )
 
+    @staticmethod
+    def _relationship_box(relationship: Optional[Dict[str, Any]], role: str) -> Optional[List[float]]:
+        """Read a subject/object box from the supported relationship schemas."""
+        if not relationship:
+            return None
+        candidates = [
+            relationship.get(f'{role}_bbox'),
+            relationship.get(f'{role}_box'),
+            relationship.get(role, {}).get('bbox') if isinstance(relationship.get(role), dict) else None,
+        ]
+        for box in candidates:
+            if isinstance(box, (list, tuple)) and len(box) >= 4:
+                return [float(value) for value in box[:4]]
+        return None
+
+    def _attach_relationship_boxes(
+        self,
+        relationships: List[Dict[str, Any]],
+        objects: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Attach object boxes to label-based GT relationships when available."""
+        enriched = []
+        for relationship in relationships or []:
+            if not relationship:
+                continue
+            item = dict(relationship)
+            subject_idx = self._find_object_index(objects, relationship.get('subject', ''))
+            object_idx = self._find_object_index(objects, relationship.get('object', ''))
+            if self._relationship_box(item, 'subject') is None and subject_idx is not None:
+                item['subject_bbox'] = objects[subject_idx].get('bbox')
+            if self._relationship_box(item, 'object') is None and object_idx is not None:
+                item['object_bbox'] = objects[object_idx].get('bbox')
+            enriched.append(item)
+        return enriched
+
+    def _match_sgdet_triplets(
+        self,
+        predictions: List[Dict[str, Any]],
+        ground_truths: List[Dict[str, Any]],
+        iou_threshold: float = 0.5,
+    ) -> int:
+        """Count one-to-one SGDET matches for (subject, predicate, object).
+
+        A prediction is correct only when the three labels match and both the
+        subject and object boxes have IoU >= ``iou_threshold`` with an unused
+        ground-truth triplet. This is Recall@K matching, not AP calculation.
+        """
+        matched_gt = set()
+        hits = 0
+        for prediction in predictions or []:
+            pred_tuple = self._normalize_relationship_tuple(prediction)
+            pred_subject_box = self._relationship_box(prediction, 'subject')
+            pred_object_box = self._relationship_box(prediction, 'object')
+            if not all(pred_tuple) or pred_subject_box is None or pred_object_box is None:
+                continue
+            best_index = None
+            best_iou = 0.0
+            for index, ground_truth in enumerate(ground_truths or []):
+                if index in matched_gt or self._normalize_relationship_tuple(ground_truth) != pred_tuple:
+                    continue
+                gt_subject_box = self._relationship_box(ground_truth, 'subject')
+                gt_object_box = self._relationship_box(ground_truth, 'object')
+                if gt_subject_box is None or gt_object_box is None:
+                    continue
+                pair_iou = min(
+                    self._compute_iou(pred_subject_box, gt_subject_box),
+                    self._compute_iou(pred_object_box, gt_object_box),
+                )
+                if pair_iou > best_iou:
+                    best_iou = pair_iou
+                    best_index = index
+            if best_index is not None and best_iou >= iou_threshold:
+                matched_gt.add(best_index)
+                hits += 1
+        return hits
+
+    def _calculate_sgdet_recall_at_k(
+        self,
+        all_ground_truths: List[List[Dict[str, Any]]],
+        all_predictions: List[List[Dict[str, Any]]],
+        k: int = 50,
+        iou_threshold: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Calculate SGDET Recall@K over triplets with subject/object IoU."""
+        total_hits = 0
+        total_ground_truths = 0
+        evaluated = 0
+        for ground_truths, predictions in zip(all_ground_truths, all_predictions):
+            valid_ground_truths = [
+                item for item in ground_truths or []
+                if self._relationship_box(item, 'subject') is not None
+                and self._relationship_box(item, 'object') is not None
+            ]
+            if valid_ground_truths:
+                evaluated += 1
+            total_ground_truths += len(valid_ground_truths)
+            ranked_predictions = sorted(
+                predictions or [],
+                key=lambda item: float(item.get('confidence', 0.0)),
+                reverse=True,
+            )[:k]
+            total_hits += self._match_sgdet_triplets(
+                ranked_predictions, valid_ground_truths, iou_threshold
+            )
+        recall = total_hits / total_ground_truths if total_ground_truths else 0.0
+        return {
+            f'sgdet_recall@{k}': recall,
+            f'sgdet_hits@{k}': total_hits,
+            'sgdet_ground_truths': total_ground_truths,
+            'sgdet_num_samples': evaluated,
+            'sgdet_iou_threshold': iou_threshold,
+        }
+
     def _compute_relationship_confusion(
         self,
         ground_truth: List[Tuple[str, str, str]],
@@ -1745,6 +1862,11 @@ class RelationshipReinforcementLearning:
                 'mr@20': 0.0,
                 'mr@50': 0.0,
                 'mr@100': 0.0,
+                'sgdet_recall@50': 0.0,
+                'sgdet_hits@50': 0,
+                'sgdet_ground_truths': 0,
+                'sgdet_num_samples': 0,
+                'sgdet_iou_threshold': 0.5,
             }
 
         print(f"[RL] Evaluating relationship metrics on {len(evaluation_data)} samples")
@@ -1840,6 +1962,11 @@ class RelationshipReinforcementLearning:
                 'mr@20': 0.0,
                 'mr@50': 0.0,
                 'mr@100': 0.0,
+                'sgdet_recall@50': 0.0,
+                'sgdet_hits@50': 0,
+                'sgdet_ground_truths': 0,
+                'sgdet_num_samples': 0,
+                'sgdet_iou_threshold': 0.5,
             }
 
         precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
@@ -1849,12 +1976,18 @@ class RelationshipReinforcementLearning:
         variance = sum((score - mean_f1) ** 2 for score in per_sample_f1) / len(per_sample_f1) if per_sample_f1 else 0.0
         std_f1 = math.sqrt(variance)
 
-        # Calculate mR@K metrics
+        # Calculate mR@K and SGDET Recall@50 metrics.
         mr_at_k_results = self._calculate_mr_at_k(all_ground_truths, all_predictions)
+        sgdet_results = self._calculate_sgdet_recall_at_k(
+            all_ground_truths, all_predictions, k=50, iou_threshold=0.5
+        )
 
         print(f"[RL] Relationship evaluation completed: P={precision:.3f}, R={recall:.3f}, F1={f1:.3f} (evaluated {evaluated} samples)")
         print(f"[RL] mR@K metrics: mR@10={mr_at_k_results.get('mr@10', 0.0):.4f}, mR@20={mr_at_k_results.get('mr@20', 0.0):.4f}, "
               f"mR@50={mr_at_k_results.get('mr@50', 0.0):.4f}, mR@100={mr_at_k_results.get('mr@100', 0.0):.4f}")
+        print(f"[RL] SGDET Recall@50={sgdet_results['sgdet_recall@50']:.4f} "
+              f"(hits={sgdet_results['sgdet_hits@50']}/{sgdet_results['sgdet_ground_truths']}, "
+              f"IoU={sgdet_results['sgdet_iou_threshold']:.2f})")
         
         return {
             'precision': precision,
@@ -1867,6 +2000,7 @@ class RelationshipReinforcementLearning:
             'num_samples': evaluated,
             'per_sample_f1': per_sample_f1,
             **mr_at_k_results,  # Add mR@K metrics
+            **sgdet_results,
         }
 
     def train_episode(self, original_relationships, synthetic_data=None, action_context: Optional[Dict[str, Any]] = None, done: bool = False):

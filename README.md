@@ -1589,4 +1589,6 @@ Mặc định, vùng có YOLO confidence `< REGIONCLIP_TRANSFER_THRESHOLD` (`0.5
 
 Pipeline ghi log số proposal YOLO, số vùng chuyển sang RegionCLIP, số vùng được chấp nhận, bị từ chối và số vùng giữ lại. Các thông tin về Ubuntu, GPU, CUDA, dataset, batch, epoch và kết quả đánh giá vẫn phải lấy từ lần chạy thực tế; source không tự suy ra các thông tin đó.
 
+Khi đánh giá scene graph, `RL/reinforcement_learning.py` trả thêm `sgdet_recall@50`. Đây là Recall@50 theo bộ ba `(subject, predicate, object)`, không phải AP@50: lấy tối đa 50 dự đoán có confidence cao nhất, yêu cầu ba nhãn khớp và IoU của cả hộp subject lẫn object đạt ít nhất `0.50`. Kết quả gồm `sgdet_recall@50`, `sgdet_hits@50`, `sgdet_ground_truths` và `sgdet_iou_threshold`. Metric chỉ tính được khi ground truth và prediction có bbox subject/object; mẫu thiếu bbox không được đưa vào mẫu số.
+
 RegionCLIP reference: https://github.com/microsoft/RegionCLIP và model zoo chính thức trong `docs/MODEL_ZOO.md`.
