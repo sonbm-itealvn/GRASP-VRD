@@ -324,14 +324,19 @@ class AutoAnnotator:
         """Annotate sử dụng YOLO+CLIP (fallback)."""
         try:
             # Sử dụng pipeline hiện có
-            detected_objects, yolo_labels, original_image, feature_map, global_context = \
+            detected_objects, yolo_labels, yolo_confidences, original_image, feature_map, global_context = \
                 detection_pipeline.detect_objects(image_path)
             
             if not detected_objects:
                 return []
             
-            classified_results = detection_pipeline.classify_with_clip(
-                detected_objects, yolo_labels
+            classified_results = (
+                detection_pipeline.classify_regions_with_regionclip(
+                    original_image, detected_objects, yolo_labels, yolo_confidences
+                ) if getattr(detection_pipeline, "regionclip_model", None) is not None
+                else detection_pipeline.classify_with_clip(
+                    detected_objects, yolo_labels, yolo_confidences
+                )
             )
             
             objects = []

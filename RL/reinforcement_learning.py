@@ -575,7 +575,7 @@ class RelationshipReinforcementLearning:
         global_context = detection_data[0].get('global_context', [])
         if not global_context:
             try:
-                _, _, _, _, global_context = detection_pipeline.detect_objects(image_path)
+                _, _, _, _, _, global_context = detection_pipeline.detect_objects(image_path)
             except Exception:
                 global_context = []
         if relationships_path and os.path.exists(relationships_path):
@@ -988,7 +988,7 @@ class RelationshipReinforcementLearning:
     def _detect_objects_for_image(self, pil_image: Image.Image) -> Tuple[List[Dict[str, Any]], Optional[List[float]]]:
         detection_model = self._ensure_detection_model()
         try:
-            _, _, _, _, global_context = detection_pipeline.detect_objects(pil_image)
+            _, _, _, _, _, global_context = detection_pipeline.detect_objects(pil_image)
         except Exception:
             global_context = []
         results = detection_model.predict(
@@ -1035,7 +1035,7 @@ class RelationshipReinforcementLearning:
 
     def _extract_objects_with_clip(self, image_path: str) -> Optional[Dict[str, Any]]:
         try:
-            detected_objects, yolo_labels, original_image, feature_map, global_context = detection_pipeline.detect_objects(image_path)
+            detected_objects, yolo_labels, yolo_confidences, original_image, feature_map, global_context = detection_pipeline.detect_objects(image_path)
         except Exception as exc:
             print(f"[RL] Detection failed for {image_path}: {exc}")
             return None
@@ -1044,7 +1044,12 @@ class RelationshipReinforcementLearning:
             print(f"[RL] No objects detected in {image_path}")
             return None
 
-        classified_results = detection_pipeline.classify_with_clip(detected_objects, yolo_labels)
+        classified_results = (
+            detection_pipeline.classify_regions_with_regionclip(
+                original_image, detected_objects, yolo_labels, yolo_confidences
+            ) if getattr(detection_pipeline, "regionclip_model", None) is not None
+            else detection_pipeline.classify_with_clip(detected_objects, yolo_labels, yolo_confidences)
+        )
         boxes = [bbox for _, bbox in classified_results]
         roi_features = detection_pipeline.extract_roi_features(feature_map, boxes, original_image.shape)
 

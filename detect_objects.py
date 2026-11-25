@@ -15,6 +15,7 @@ from ultralytics import YOLO
 from typing import List, Tuple, Dict, Any
 import tkinter as tk
 from tkinter import filedialog
+from regionclip_adapter import RegionCLIPClassifier
 
 # Load .env file if available
 try:
@@ -120,6 +121,19 @@ clip_model.eval()  # Set to eval mode for faster inference
 # CLIP on CUDA loads in FP16 by default, but some internal ops require FP32
 # Force FP32 to avoid dtype mismatch errors
 clip_model = clip_model.float()
+
+# Optional official RegionCLIP backend. It is enabled only when the required
+# checkpoint/config/concept files are configured through environment variables.
+try:
+    regionclip_model = RegionCLIPClassifier.from_env()
+except Exception as exc:
+    print(f"[RegionCLIP] Disabled: {exc}")
+    regionclip_model = None
+
+REGIONCLIP_TRANSFER_THRESHOLD = float(os.getenv("REGIONCLIP_TRANSFER_THRESHOLD", "0.50"))
+REGIONCLIP_REJECT_THRESHOLD = float(os.getenv("REGIONCLIP_REJECT_THRESHOLD", "0.30"))
+REGIONCLIP_REJECT_ACTION = os.getenv("REGIONCLIP_REJECT_ACTION", "keep_yolo").strip().lower()
+REGIONCLIP_ALL_REGIONS = os.getenv("REGIONCLIP_ALL_REGIONS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Danh sách từ vựng mở rộng (có thể tùy chỉnh)
 animals = [
@@ -342,7 +356,7 @@ def detect_objects(image_source):
     feature_map = _consume_feature_map()
     global_context = _compute_global_context(feature_map)
     
-    detected_objects, yolo_labels = [], []
+    detected_objects, yolo_labels, yolo_confidences = [], [], []
     
     # Process merged detections
     for det in merged_detections:
@@ -364,64 +378,77 @@ def detect_objects(image_source):
             pass
         
         yolo_labels.append(class_name)
+        yolo_confidences.append(float(det['confidence']))
         print(f"✅ {det['source'].upper()}: {class_name} (conf: {det['confidence']:.3f})")
     
     print(f"📊 Total merged detections: {len(detected_objects)} (COCO + Fire)")
     
-    return detected_objects, yolo_labels, image, feature_map, global_context
+    return detected_objects, yolo_labels, yolo_confidences, image, feature_map, global_context
 
 # Phân loại với CLIP, fallback về YOLO nếu confidence thấp
 # OPTIMIZED: Batch processing for 3-5x speedup
-def classify_with_clip(detected_objects, yolo_labels):
-    results = []
-    # Use pre-computed text features instead of re-encoding
-    text_features = _precomputed_text_features
+def classify_with_clip(detected_objects, yolo_labels, yolo_confidences=None):
+    """Classify proposal crops.
 
-    # 🌟 Lấy toàn bộ nhãn từ cả 2 models làm nhãn quan trọng
+    Policy:
+      1. YOLO confidence >= REGIONCLIP_TRANSFER_THRESHOLD keeps YOLO label.
+      2. Low-confidence regions go to RegionCLIP (or legacy CLIP if RegionCLIP is unavailable).
+      3. RegionCLIP score < REGIONCLIP_REJECT_THRESHOLD is rejected. By default the
+         region is retained with its YOLO label; set REGIONCLIP_REJECT_ACTION=drop
+         to remove rejected regions explicitly.
+
+    REGIONCLIP_TRANSFER_THRESHOLD and REGIONCLIP_REJECT_THRESHOLD are validation
+    parameters, not claims of a calibrated accuracy. Tune them on a held-out set.
+    """
+    if yolo_confidences is None:
+        yolo_confidences = [1.0] * len(detected_objects)
+    boxes = [item[1] for item in detected_objects]
+    regionclip_indices = [
+        i for i, conf in enumerate(yolo_confidences)
+        if regionclip_model is not None and (REGIONCLIP_ALL_REGIONS or conf < REGIONCLIP_TRANSFER_THRESHOLD)
+    ]
+
+    regionclip_results = {}
+    if regionclip_indices:
+        # All crops originate from the same image in the current call. The original
+        # image is not available here, so RegionCLIP is called from run_pipeline via
+        # classify_regions_with_regionclip when configured.
+        print(f"[RegionCLIP] {len(regionclip_indices)} vùng điểm thấp cần gán nhãn lại; "
+              "sẽ dùng đường dẫn classify_regions_with_regionclip().")
+
+    # Legacy CLIP path remains the fallback and handles the non-RegionCLIP mode.
+    results = []
+    text_features = _precomputed_text_features
     important_labels = list(yolo_model.names.values())
     if fire_model is not None:
         important_labels.extend(list(fire_model.names.values()))
-    important_labels = list(set(important_labels))  # Remove duplicates
-    
-    # OPTIMIZATION: Batch process all images at once
-    valid_indices = []
-    image_batch = []
-    
+    important_labels = list(set(important_labels))
+    valid_indices, image_batch = [], []
     for idx, (cropped_pil, bbox) in enumerate(detected_objects):
         if isinstance(cropped_pil, Image.Image):
             image_batch.append(preprocess(cropped_pil))
             valid_indices.append(idx)
         else:
-            results.append((yolo_labels[idx], detected_objects[idx][1]))
-    
-    # Process batch if we have valid images
+            results.append((yolo_labels[idx], bbox))
     if image_batch:
-        batch_tensor = torch.stack(image_batch).to(device)
-        # Keep in FP32 to match CLIP model dtype
-        batch_tensor = batch_tensor.float()
-        
+        batch_tensor = torch.stack(image_batch).to(device).float()
         with torch.no_grad():
             image_features = clip_model.encode_image(batch_tensor)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             similarities = (image_features @ text_features.T).softmax(dim=-1)
-        
-        # Process results
         batch_results = [None] * len(detected_objects)
         for batch_idx, orig_idx in enumerate(valid_indices):
             sim_row = similarities[batch_idx]
             best_label = label_texts[sim_row.argmax().item()]
             confidence = sim_row.max().item()
             bbox = detected_objects[orig_idx][1]
-            
-            # 🎯 Logic thông minh giữ nhãn YOLO nếu CLIP nhận sai
-            if yolo_labels[orig_idx] in important_labels and best_label != yolo_labels[orig_idx]:
+            # Only use legacy CLIP for regions not delegated to RegionCLIP.
+            if orig_idx < len(yolo_confidences) and yolo_confidences[orig_idx] < REGIONCLIP_TRANSFER_THRESHOLD and regionclip_model is not None:
                 batch_results[orig_idx] = (yolo_labels[orig_idx], bbox)
-            elif confidence < 0.3:
+            elif yolo_labels[orig_idx] in important_labels or confidence < 0.3:
                 batch_results[orig_idx] = (yolo_labels[orig_idx], bbox)
             else:
                 batch_results[orig_idx] = (best_label.strip(), bbox)
-        
-        # Merge batch results with already processed results
         final_results = []
         result_idx = 0
         for idx in range(len(detected_objects)):
@@ -431,8 +458,40 @@ def classify_with_clip(detected_objects, yolo_labels):
                 final_results.append(results[result_idx])
                 result_idx += 1
         return final_results
-    
     return results
+
+
+def classify_regions_with_regionclip(image_bgr, detected_objects, yolo_labels, yolo_confidences):
+    """Apply RegionCLIP to configured low-confidence YOLO regions and log counts."""
+    if regionclip_model is None:
+        return None
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    candidates = [
+        i for i, conf in enumerate(yolo_confidences)
+        if REGIONCLIP_ALL_REGIONS or conf < REGIONCLIP_TRANSFER_THRESHOLD
+    ]
+    if not candidates:
+        print('[RegionCLIP] 0 vùng chuyển sang RegionCLIP; 0 vùng bị từ chối.')
+        return [(label, item[1]) for label, item in zip(yolo_labels, detected_objects)]
+    predictions = regionclip_model.classify(image_rgb, [detected_objects[i][1] for i in candidates])
+    output = [(label, item[1]) for label, item in zip(yolo_labels, detected_objects)]
+    accepted = rejected = 0
+    for idx, prediction in zip(candidates, predictions):
+        if prediction.accepted and prediction.label:
+            output[idx] = (prediction.label, detected_objects[idx][1])
+            accepted += 1
+        else:
+            rejected += 1
+            if REGIONCLIP_REJECT_ACTION == 'drop':
+                output[idx] = None
+            else:
+                output[idx] = (yolo_labels[idx], detected_objects[idx][1])
+        print(f"[RegionCLIP] idx={idx} yolo_conf={yolo_confidences[idx]:.3f} "
+              f"score={prediction.score:.4f} accepted={prediction.accepted}")
+    output = [item for item in output if item is not None]
+    print(f"[RegionCLIP] YOLO proposals={len(detected_objects)}; "
+          f"transferred={len(candidates)}; accepted={accepted}; rejected={rejected}; kept={len(output)}")
+    return output
 
 # Full pipeline
 def run_pipeline(image_path=None):
@@ -444,8 +503,13 @@ def run_pipeline(image_path=None):
             print("❌ Không có file nào được chọn!")
             return {}
 
-    detected_objects, yolo_labels, original_image, feature_map, global_context = detect_objects(image_path)
-    classified_results = classify_with_clip(detected_objects, yolo_labels)
+    detected_objects, yolo_labels, yolo_confidences, original_image, feature_map, global_context = detect_objects(image_path)
+    if regionclip_model is not None:
+        classified_results = classify_regions_with_regionclip(
+            original_image, detected_objects, yolo_labels, yolo_confidences
+        )
+    else:
+        classified_results = classify_with_clip(detected_objects, yolo_labels, yolo_confidences)
 
     boxes = [bbox for _, bbox in classified_results]
     roi_features = extract_roi_features(feature_map, boxes, original_image.shape)

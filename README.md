@@ -1581,3 +1581,12 @@ for epoch = 1, ..., E:
 15. **GroundingDINO:** S. Liu et al., "Grounding DINO: Marrying DINO with Grounded Pre-Training," *arXiv*, 2023.
 16. **Focal Loss:** T.-Y. Lin et al., "Focal Loss for Dense Object Detection," *ICCV*, 2017.
 
+## RegionCLIP augmentation
+
+`detect_objects.py` hỗ trợ tùy chọn RegionCLIP chính thức của Microsoft để gán nhãn lại các vùng YOLO có confidence thấp. Mã tích hợp nằm trong `regionclip_adapter.py` và không vendor mã RegionCLIP/Detectron2 vào repository này. Sao chép `.env.regionclip.example` thành `.env`, đặt `REGIONCLIP_ROOT`, checkpoint, config, concept embedding và file nhãn có cùng thứ tự với các hàng embedding.
+
+Mặc định, vùng có YOLO confidence `< REGIONCLIP_TRANSFER_THRESHOLD` (`0.50`) được chuyển sang RegionCLIP; vùng confidence cao giữ nhãn YOLO. Đặt `REGIONCLIP_ALL_REGIONS=1` nếu muốn mọi vùng qua RegionCLIP. Điểm RegionCLIP là softmax trên cosine similarity với `REGIONCLIP_TEMPERATURE` (`0.01`). Nếu điểm cao nhất `< REGIONCLIP_REJECT_THRESHOLD` (`0.30`), nhãn bị từ chối. `REGIONCLIP_REJECT_ACTION=keep_yolo` giữ nhãn YOLO; `drop` bỏ vùng. Các ngưỡng này là giá trị khởi tạo cần hiệu chỉnh trên validation set, không phải accuracy đã được đảm bảo.
+
+Pipeline ghi log số proposal YOLO, số vùng chuyển sang RegionCLIP, số vùng được chấp nhận, bị từ chối và số vùng giữ lại. Các thông tin về Ubuntu, GPU, CUDA, dataset, batch, epoch và kết quả đánh giá vẫn phải lấy từ lần chạy thực tế; source không tự suy ra các thông tin đó.
+
+RegionCLIP reference: https://github.com/microsoft/RegionCLIP và model zoo chính thức trong `docs/MODEL_ZOO.md`.
